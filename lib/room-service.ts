@@ -108,6 +108,20 @@ async function updateGame(game: GameState): Promise<GameRecord> {
   return data as GameRecord;
 }
 
+async function updateRoomRecord(
+  roomId: string,
+  updates: Partial<Pick<RoomRecord, "current_game_id" | "next_starting_team">>
+): Promise<RoomRecord> {
+  const supabase = createServerSupabaseClient();
+  const { data, error } = await supabase.from("rooms").update(updates).eq("id", roomId).select("*").single();
+
+  if (error) {
+    throw error;
+  }
+
+  return data as RoomRecord;
+}
+
 async function createGameRecord(room: RoomRecord, startingTeam: Team): Promise<GameRecord> {
   const supabase = createServerSupabaseClient();
   const nextGame = buildGameState(WORDS, room.id, startingTeam);
@@ -159,9 +173,7 @@ export async function createRoom(preferredSlug?: string): Promise<RoomState> {
 
     if (existingRoom) {
       if (existingRoom.current_game_id) {
-        return {
-          ...(await fetchRoomStateBySlug(existingRoom.slug))!
-        };
+        return mapRoom(existingRoom, await getGameRecord(existingRoom.current_game_id));
       }
 
       return createNewGameForRoom(existingRoom.slug);
@@ -209,7 +221,6 @@ export async function createRoom(preferredSlug?: string): Promise<RoomState> {
 }
 
 export async function createNewGameForRoom(slug: string): Promise<RoomState> {
-  const supabase = createServerSupabaseClient();
   const room = await getRoomRecordBySlug(slug);
 
   if (!room) {
@@ -217,21 +228,12 @@ export async function createNewGameForRoom(slug: string): Promise<RoomState> {
   }
 
   const game = await createGameRecord(room, room.next_starting_team);
-  const { error } = await supabase
-    .from("rooms")
-    .update({
-      current_game_id: game.id,
-      next_starting_team: opposingTeam(room.next_starting_team)
-    })
-    .eq("id", room.id);
+  const updatedRoom = await updateRoomRecord(room.id, {
+    current_game_id: game.id,
+    next_starting_team: opposingTeam(room.next_starting_team)
+  });
 
-  if (error) {
-    throw error;
-  }
-
-  return {
-    ...(await fetchRoomStateBySlug(slug))!
-  };
+  return mapRoom(updatedRoom, game);
 }
 
 export async function revealCardForRoom(slug: string, cardId: string): Promise<RoomState> {
@@ -248,10 +250,7 @@ export async function revealCardForRoom(slug: string, cardId: string): Promise<R
   }
 
   const nextGame = revealCard(mapGame(gameRecord), cardId).game;
-  await updateGame(nextGame);
-  return {
-    ...(await fetchRoomStateBySlug(slug))!
-  };
+  return mapRoom(room, await updateGame(nextGame));
 }
 
 export async function endTurnForRoom(slug: string): Promise<RoomState> {
@@ -267,10 +266,7 @@ export async function endTurnForRoom(slug: string): Promise<RoomState> {
     throw new Error("Current game not found.");
   }
 
-  await updateGame(endTurn(mapGame(gameRecord)));
-  return {
-    ...(await fetchRoomStateBySlug(slug))!
-  };
+  return mapRoom(room, await updateGame(endTurn(mapGame(gameRecord))));
 }
 
 export async function revealAllForRoom(slug: string): Promise<RoomState> {
@@ -286,8 +282,5 @@ export async function revealAllForRoom(slug: string): Promise<RoomState> {
     throw new Error("Current game not found.");
   }
 
-  await updateGame(revealAll(mapGame(gameRecord)));
-  return {
-    ...(await fetchRoomStateBySlug(slug))!
-  };
+  return mapRoom(room, await updateGame(revealAll(mapGame(gameRecord))));
 }

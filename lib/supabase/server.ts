@@ -1,9 +1,9 @@
 import { createClient } from "@supabase/supabase-js";
 
-import { requirePublicSupabaseEnv, requireServiceRoleKey } from "@/lib/env";
+import { requireBrowserSupabaseConfig, requireServiceRoleKey } from "@/lib/env";
 
 export function createServerSupabaseClient() {
-  const { url } = requirePublicSupabaseEnv();
+  const { url } = requireBrowserSupabaseConfig();
   const serviceRoleKey = requireServiceRoleKey();
 
   return createClient(url, serviceRoleKey, {

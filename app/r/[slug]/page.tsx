@@ -2,7 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { RoomClient } from "@/components/room-client";
-import { hasSupabaseEnv } from "@/lib/env";
+import { hasSupabaseEnv, requireBrowserSupabaseConfig } from "@/lib/env";
 import { fetchRoomStateBySlug } from "@/lib/room-service";
 
 export const dynamic = "force-dynamic";
@@ -17,8 +17,8 @@ export default async function RoomPage({ params }: { params: Promise<{ slug: str
           <p className="font-mono text-xs uppercase tracking-[0.35em] text-black/55">Setup required</p>
           <h1 className="mt-4 font-display text-4xl uppercase">Missing Supabase environment</h1>
           <p className="mt-4 text-base leading-7 text-black/70">
-            Add the values from <code className="rounded bg-black/5 px-1.5 py-0.5 text-[13px]">.env.example</code>,
-            apply <code className="rounded bg-black/5 px-1.5 py-0.5 text-[13px]">supabase/schema.sql</code>,
+            Add the env vars, run{" "}
+            <code className="rounded bg-black/5 px-1.5 py-0.5 text-[13px]">supabase/schema.sql</code>,
             and redeploy.
           </p>
           <Link
@@ -38,5 +38,5 @@ export default async function RoomPage({ params }: { params: Promise<{ slug: str
     notFound();
   }
 
-  return <RoomClient initialRoom={room} />;
+  return <RoomClient initialRoom={room} browserSupabaseConfig={requireBrowserSupabaseConfig()} />;
 }

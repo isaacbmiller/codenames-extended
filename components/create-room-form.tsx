@@ -78,7 +78,7 @@ export function CreateRoomForm({ configured }: CreateRoomFormProps) {
         disabled={isPending || !configured}
         className="w-full rounded-[22px] bg-ink px-5 py-4 font-display text-xl uppercase tracking-[0.08em] text-white transition hover:-translate-y-0.5 hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
       >
-        {isPending ? "Working..." : "Create random room"}
+        {isPending ? "Working..." : "New room"}
       </button>
 
       <form onSubmit={handleJoinRoom} className="grid gap-3 md:grid-cols-[1fr_auto]">
@@ -99,11 +99,6 @@ export function CreateRoomForm({ configured }: CreateRoomFormProps) {
           Open room
         </button>
       </form>
-
-      <p className="text-sm leading-6 text-black/60">
-        The default room key is <code className="rounded bg-black/5 px-1.5 py-0.5">game-night</code>.
-        Opening it will create that room the first time and reuse it after that.
-      </p>
 
       {error ? (
         <div className="rounded-[18px] border border-red-900/10 bg-red-100/70 px-4 py-3 text-sm text-red-950">

@@ -1,5 +1,3 @@
-import { randomUUID } from "crypto";
-
 import type { BoardCard, CardRole, GameState, RemainingCounts, Team } from "@/lib/types";
 
 export interface RevealOutcome {
@@ -41,6 +39,14 @@ function shuffle<T>(values: T[], random = Math.random): T[] {
   return next;
 }
 
+function createCardId() {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+
+  return `card-${Math.random().toString(36).slice(2, 12)}`;
+}
+
 function buildRoleDeck(startingTeam: Team): CardRole[] {
   const otherTeam = opposingTeam(startingTeam);
 
@@ -61,7 +67,7 @@ export function buildBoard(words: string[], startingTeam: Team, random = Math.ra
   const roles = shuffle(buildRoleDeck(startingTeam), random);
 
   return selectedWords.map((word, index) => ({
-    id: randomUUID(),
+    id: createCardId(),
     word,
     role: roles[index],
     revealed: false
@@ -102,6 +108,17 @@ export function revealAll(game: GameState): GameState {
   };
 }
 
+function finishGame(game: GameState, cards: BoardCard[], remaining: RemainingCounts, winner: Team): GameState {
+  return {
+    ...game,
+    cards,
+    remaining,
+    status: "finished",
+    winner,
+    revealedAll: true
+  };
+}
+
 export function revealCard(game: GameState, cardId: string): RevealOutcome {
   if (game.status !== "active") {
     return {
@@ -136,13 +153,7 @@ export function revealCard(game: GameState, cardId: string): RevealOutcome {
 
   if (revealedCard.role === "assassin") {
     return {
-      game: {
-        ...game,
-        cards,
-        remaining,
-        status: "finished",
-        winner: otherTeam
-      },
+      game: finishGame(game, cards, remaining, otherTeam),
       revealedCard,
       turnEnded: true,
       winningTeam: otherTeam
@@ -151,13 +162,7 @@ export function revealCard(game: GameState, cardId: string): RevealOutcome {
 
   if (remaining.red === 0) {
     return {
-      game: {
-        ...game,
-        cards,
-        remaining,
-        status: "finished",
-        winner: "red"
-      },
+      game: finishGame(game, cards, remaining, "red"),
       revealedCard,
       turnEnded: revealedCard.role !== "red",
       winningTeam: "red"
@@ -166,13 +171,7 @@ export function revealCard(game: GameState, cardId: string): RevealOutcome {
 
   if (remaining.blue === 0) {
     return {
-      game: {
-        ...game,
-        cards,
-        remaining,
-        status: "finished",
-        winner: "blue"
-      },
+      game: finishGame(game, cards, remaining, "blue"),
       revealedCard,
       turnEnded: revealedCard.role !== "blue",
       winningTeam: "blue"

@@ -80,6 +80,7 @@ describe("game logic", () => {
     const result = revealCard(makeGame(), "assassin");
     expect(result.game.status).toBe("finished");
     expect(result.game.winner).toBe("blue");
+    expect(result.game.revealedAll).toBe(true);
   });
 
   it("wins immediately when a team finds its final card", () => {
@@ -90,6 +91,7 @@ describe("game logic", () => {
     const result = revealCard(makeGame({ remaining: { red: 1, blue: 1 } }, cards), "red");
     expect(result.game.status).toBe("finished");
     expect(result.game.winner).toBe("red");
+    expect(result.game.revealedAll).toBe(true);
   });
 
   it("switches teams on explicit end turn", () => {

@@ -2,15 +2,20 @@
 
 import clsx from "clsx";
 import Link from "next/link";
-import { useEffect, useState, useTransition } from "react";
+import { useEffect, useRef, useState } from "react";
 
+import type { BrowserSupabaseConfig } from "@/lib/env";
+import { endTurn as applyEndTurn, revealCard as applyRevealCard } from "@/lib/game-logic";
 import { getBrowserSupabaseClient } from "@/lib/supabase/browser";
 import type { BoardCard, GameState, RoomState, ViewMode } from "@/lib/types";
 
 const VIEW_KEY_PREFIX = "codenames-view:";
 
+type PendingAction = "new-game" | "end-turn" | "reveal" | null;
+
 interface RoomClientProps {
   initialRoom: RoomState;
+  browserSupabaseConfig: BrowserSupabaseConfig;
 }
 
 function getCardStyles(card: BoardCard, viewMode: ViewMode, revealAll: boolean) {
@@ -50,12 +55,17 @@ function readSavedView(slug: string): ViewMode {
   return saved === "spymaster" ? "spymaster" : "operatives";
 }
 
-export function RoomClient({ initialRoom }: RoomClientProps) {
+export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientProps) {
   const [room, setRoom] = useState(initialRoom);
   const [viewMode, setViewMode] = useState<ViewMode>("operatives");
   const [feedback, setFeedback] = useState<string | null>(null);
-  const [shareUrl, setShareUrl] = useState(`/r/${initialRoom.slug}`);
-  const [isPending, startTransition] = useTransition();
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [roomUrl, setRoomUrl] = useState(`/r/${initialRoom.slug}`);
+  const [pendingAction, setPendingAction] = useState<PendingAction>(null);
+  const roomRef = useRef(room);
+  const refreshTimeoutRef = useRef<number | null>(null);
+  const refreshInFlightRef = useRef(false);
+  const refreshQueuedRef = useRef(false);
 
   useEffect(() => {
     setViewMode(readSavedView(initialRoom.slug));
@@ -66,33 +76,67 @@ export function RoomClient({ initialRoom }: RoomClientProps) {
       return;
     }
 
-    window.localStorage.setItem(`${VIEW_KEY_PREFIX}${room.slug}`, viewMode);
-  }, [room.slug, viewMode]);
+    setRoomUrl(`${window.location.origin}/r/${room.slug}`);
+  }, [room.slug]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
 
-    setShareUrl(window.location.href);
-  }, [room.slug]);
+    window.localStorage.setItem(`${VIEW_KEY_PREFIX}${room.slug}`, viewMode);
+  }, [room.slug, viewMode]);
 
   useEffect(() => {
-    const supabase = getBrowserSupabaseClient();
+    roomRef.current = room;
+  }, [room]);
+
+  useEffect(() => {
+    return () => {
+      if (refreshTimeoutRef.current !== null) {
+        window.clearTimeout(refreshTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const supabase = getBrowserSupabaseClient(browserSupabaseConfig);
     const channel = supabase
       .channel(`room:${room.id}`)
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "rooms", filter: `slug=eq.${room.slug}` },
-        () => {
-          void refreshRoom();
+        (payload) => {
+          const currentRoom = roomRef.current;
+
+          if (
+            payload.eventType === "UPDATE" &&
+            currentRoom.updatedAt === payload.new.updated_at &&
+            currentRoom.currentGame?.id === payload.new.current_game_id &&
+            currentRoom.nextStartingTeam === payload.new.next_starting_team
+          ) {
+            return;
+          }
+
+          scheduleRefreshRoom();
         }
       )
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "games", filter: `room_id=eq.${room.id}` },
-        () => {
-          void refreshRoom();
+        (payload) => {
+          const currentGame = roomRef.current.currentGame;
+
+          if (
+            payload.eventType === "UPDATE" &&
+            currentGame &&
+            currentGame.id === payload.new.id &&
+            currentGame.updatedAt === payload.new.updated_at
+          ) {
+            return;
+          }
+
+          scheduleRefreshRoom();
         }
       )
       .subscribe();
@@ -100,36 +144,145 @@ export function RoomClient({ initialRoom }: RoomClientProps) {
     return () => {
       void supabase.removeChannel(channel);
     };
-  }, [room.id, room.slug]);
+  }, [browserSupabaseConfig, room.id, room.slug]);
 
   async function refreshRoom() {
-    const response = await fetch(`/api/rooms/${room.slug}`, { cache: "no-store" });
-    const payload = (await response.json()) as { room?: RoomState; error?: string };
+    if (refreshInFlightRef.current) {
+      refreshQueuedRef.current = true;
+      return;
+    }
 
-    if (response.ok && payload.room) {
-      setRoom(payload.room);
+    refreshInFlightRef.current = true;
+    try {
+      const response = await fetch(`/api/rooms/${room.slug}`, { cache: "no-store" });
+      const payload = (await response.json()) as { room?: RoomState; error?: string };
+
+      if (response.ok && payload.room) {
+        setRoom(payload.room);
+      }
+    } finally {
+      refreshInFlightRef.current = false;
+
+      if (refreshQueuedRef.current) {
+        refreshQueuedRef.current = false;
+        void refreshRoom();
+      }
     }
   }
 
-  async function sendAction(path: string, body?: object) {
-    setFeedback(null);
+  function scheduleRefreshRoom(delay = 80) {
+    if (typeof window === "undefined") {
+      return;
+    }
 
-    startTransition(async () => {
+    if (refreshTimeoutRef.current !== null) {
+      return;
+    }
+
+    refreshTimeoutRef.current = window.setTimeout(() => {
+      refreshTimeoutRef.current = null;
+      void refreshRoom();
+    }, delay);
+  }
+
+  async function sendAction(
+    path: string,
+    options: {
+      body?: object;
+      optimisticRoom?: RoomState;
+      pendingAction: Exclude<PendingAction, null>;
+    }
+  ) {
+    setFeedback(null);
+    setPendingAction(options.pendingAction);
+
+    if (options.pendingAction === "new-game") {
+      setMobileMenuOpen(false);
+    }
+
+    const previousRoom = roomRef.current;
+
+    if (options.optimisticRoom) {
+      setRoom(options.optimisticRoom);
+    }
+
+    try {
       const response = await fetch(path, {
         method: "POST",
-        headers: body ? { "Content-Type": "application/json" } : undefined,
-        body: body ? JSON.stringify(body) : undefined
+        headers: options.body ? { "Content-Type": "application/json" } : undefined,
+        body: options.body ? JSON.stringify(options.body) : undefined
       });
 
       const payload = (await response.json()) as { room?: RoomState; error?: string };
 
       if (!response.ok || !payload.room) {
+        if (options.optimisticRoom) {
+          setRoom(previousRoom);
+        }
         setFeedback(payload.error ?? "Action failed.");
         return;
       }
 
       setRoom(payload.room);
+    } catch {
+      if (options.optimisticRoom) {
+        setRoom(previousRoom);
+      }
+      setFeedback("Action failed.");
+      void refreshRoom();
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
+  function revealCardOptimistically(cardId: string) {
+    const currentGame = room.currentGame;
+
+    if (!currentGame) {
+      return;
+    }
+
+    const outcome = applyRevealCard(currentGame, cardId);
+
+    if (!outcome.revealedCard) {
+      return;
+    }
+
+    void sendAction(`/api/rooms/${room.slug}/reveal`, {
+      body: { cardId },
+      optimisticRoom: { ...room, currentGame: outcome.game },
+      pendingAction: "reveal"
     });
+  }
+
+  function endTurnOptimistically() {
+    const currentGame = room.currentGame;
+
+    if (!currentGame) {
+      return;
+    }
+
+    void sendAction(`/api/rooms/${room.slug}/end-turn`, {
+      optimisticRoom: { ...room, currentGame: applyEndTurn(currentGame) },
+      pendingAction: "end-turn"
+    });
+  }
+
+  function createNewGame() {
+    void sendAction(`/api/rooms/${room.slug}/new-game`, {
+      pendingAction: "new-game"
+    });
+  }
+
+  function copyRoomLink() {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const url = `${window.location.origin}/r/${room.slug}`;
+    void navigator.clipboard.writeText(url);
+    setRoomUrl(url);
+    setFeedback("Room link copied.");
   }
 
   const game = room.currentGame;
@@ -141,67 +294,47 @@ export function RoomClient({ initialRoom }: RoomClientProps) {
           <h1 className="mt-4 font-display text-4xl uppercase">This room is empty</h1>
           <button
             type="button"
-            onClick={() => void sendAction(`/api/rooms/${room.slug}/new-game`)}
+            onClick={createNewGame}
             className="mt-6 inline-flex rounded-full bg-ink px-5 py-3 font-mono text-sm uppercase tracking-[0.24em] text-white"
           >
-            Create first board
+            {pendingAction === "new-game" ? "Shuffling..." : "Create first board"}
           </button>
         </div>
       </main>
     );
   }
 
-  const controlsDisabled = isPending || game.status !== "active";
+  const controlsDisabled = pendingAction !== null || game.status !== "active";
   const readOnly = viewMode === "spymaster";
-  const statusLabel =
-    game.status === "finished" && game.winner
-      ? `${game.winner.toUpperCase()} TEAM WINS`
-      : `${game.currentTurn.toUpperCase()} TEAM TURN`;
+  const winnerLabel = game.status === "finished" && game.winner ? `${game.winner.toUpperCase()} TEAM WINS` : null;
 
   return (
     <main className="grain min-h-screen px-4 py-4 md:px-6 md:py-5">
-      <div className="mx-auto flex max-w-[1400px] flex-col gap-4">
-        <section className="paper-panel px-4 py-4 md:px-6">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex flex-col gap-3">
-              <div className="flex flex-wrap items-center gap-3">
+      <div className="mx-auto flex max-w-[1500px] flex-col gap-4">
+        <section className="paper-panel px-4 py-3 md:px-5">
+          <div className="hidden items-center justify-between gap-4 md:flex">
+            <div className="flex min-w-0 flex-1 items-center gap-2.5">
+              <div className="flex min-w-0 flex-wrap items-center gap-2.5">
                 <Link
                   href="/"
                   className="rounded-full border border-black/10 px-3 py-1.5 font-mono text-xs uppercase tracking-[0.24em] text-black/60 transition hover:bg-white/45"
                 >
                   Home
                 </Link>
-                <span className="rounded-full bg-black/5 px-3 py-1.5 font-mono text-xs uppercase tracking-[0.24em] text-black/65">
+                <span className="rounded-full border border-black/10 bg-white/45 px-3 py-1.5 font-mono text-xs uppercase tracking-[0.24em] text-black/65">
                   Room {room.slug}
                 </span>
-                <span
-                  className={clsx(
-                    "rounded-full px-3 py-1.5 font-mono text-xs uppercase tracking-[0.24em]",
-                    game.status === "finished"
-                      ? "bg-[#e7dcc3] text-black/75"
-                      : game.currentTurn === "red"
-                        ? "bg-redTeam text-white"
-                        : "bg-blueTeam text-white"
-                  )}
-                >
-                  {statusLabel}
-                </span>
-                <span className="rounded-full bg-black/5 px-3 py-1.5 font-mono text-xs uppercase tracking-[0.24em] text-black/65">
-                  Starts: {game.startingTeam}
-                </span>
-              </div>
-              <div>
-                <h1 className="font-display text-3xl uppercase tracking-[0.05em] md:text-4xl">
-                  Shared board, local key
-                </h1>
-                <p className="mt-2 max-w-4xl text-sm leading-6 text-black/65 md:text-base">
-                  Use this same room link on the public screen and side computers. Public view is for
-                  operatives. Spymaster view is read-only on this device and reveals the hidden key.
-                </p>
+                {winnerLabel ? (
+                  <span className="rounded-full bg-[#ded2b7] px-3 py-1.5 font-mono text-xs uppercase tracking-[0.24em] text-black/75">
+                    {winnerLabel}
+                  </span>
+                ) : null}
+                <HeaderTeamBadge team="red" remaining={game.remaining.red} active={game.currentTurn === "red"} />
+                <HeaderTeamBadge team="blue" remaining={game.remaining.blue} active={game.currentTurn === "blue"} />
               </div>
             </div>
 
-            <div className="flex flex-col gap-3 lg:items-end">
+            <div className="flex shrink-0 items-center gap-3">
               <div className="flex rounded-full border border-black/10 bg-white/55 p-1">
                 <button
                   type="button"
@@ -224,139 +357,228 @@ export function RoomClient({ initialRoom }: RoomClientProps) {
                   Spymaster
                 </button>
               </div>
-              <div className="rounded-[18px] border border-black/10 bg-white/55 px-4 py-3">
-                <div className="font-mono text-[11px] uppercase tracking-[0.28em] text-black/50">
-                  Share URL
-                </div>
-                <div className="mt-2 max-w-[360px] truncate text-sm text-black/70">{shareUrl}</div>
+              <div className="flex items-center gap-2 rounded-full border border-black/10 bg-white/55 px-3 py-1.5">
+                <span className="max-w-[320px] truncate font-mono text-[11px] tracking-[0.08em] text-black/60 xl:max-w-[420px]">
+                  {roomUrl}
+                </span>
                 <button
                   type="button"
-                  onClick={() => {
-                    if (typeof window !== "undefined") {
-                      void navigator.clipboard.writeText(window.location.href);
-                      setFeedback("Room URL copied to clipboard.");
-                    }
-                  }}
-                  className="mt-3 rounded-full border border-black/10 px-3 py-1.5 font-mono text-[11px] uppercase tracking-[0.24em] text-black/65 transition hover:bg-white/60"
+                  onClick={copyRoomLink}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-black/10 bg-white/80 text-black/60 transition hover:bg-white hover:text-black"
+                  aria-label="Copy room link"
                 >
-                  Copy link
+                  <CopyIcon />
                 </button>
               </div>
             </div>
           </div>
-        </section>
 
-        <section className="grid gap-4 xl:grid-cols-[280px_minmax(0,1fr)]">
-          <aside className="paper-panel px-4 py-4 md:px-5">
-            <div className="grid gap-3">
+          <div className="flex flex-col gap-3 md:hidden">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="font-mono text-[11px] uppercase tracking-[0.24em] text-black/45">
+                  Room
+                </div>
+                <div className="mt-1 truncate font-mono text-sm uppercase tracking-[0.18em] text-black/70">
+                  {room.slug}
+                </div>
+              </div>
+
               <button
                 type="button"
-                disabled={isPending}
-                onClick={() => void sendAction(`/api/rooms/${room.slug}/new-game`)}
-                className="rounded-[18px] bg-ink px-4 py-3 font-display text-lg uppercase tracking-[0.08em] text-white transition hover:-translate-y-0.5 hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => setMobileMenuOpen((value) => !value)}
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-black/10 bg-white/60 text-black/70 transition hover:bg-white"
+                aria-label="Toggle menu"
+                aria-expanded={mobileMenuOpen}
               >
-                {isPending ? "Working..." : "New Game"}
+                <span className="flex flex-col gap-1.5">
+                  <span className="block h-[2px] w-4 rounded-full bg-current" />
+                  <span className="block h-[2px] w-4 rounded-full bg-current" />
+                  <span className="block h-[2px] w-4 rounded-full bg-current" />
+                </span>
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5">
+              {winnerLabel ? (
+                <span className="rounded-full bg-[#ded2b7] px-3 py-1.5 font-mono text-xs uppercase tracking-[0.24em] text-black/75">
+                  {winnerLabel}
+                </span>
+              ) : null}
+              <HeaderTeamBadge team="red" remaining={game.remaining.red} active={game.currentTurn === "red"} mobile />
+              <HeaderTeamBadge team="blue" remaining={game.remaining.blue} active={game.currentTurn === "blue"} mobile />
+            </div>
+
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="flex min-w-0 flex-1 rounded-full border border-black/10 bg-white/55 p-1">
+                <button
+                  type="button"
+                  onClick={() => setViewMode("operatives")}
+                  className={clsx(
+                    "flex-1 rounded-full px-4 py-2 font-mono text-xs uppercase tracking-[0.24em] transition",
+                    viewMode === "operatives" ? "bg-ink text-white" : "text-black/65"
+                  )}
+                >
+                  Public
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode("spymaster")}
+                  className={clsx(
+                    "flex-1 rounded-full px-4 py-2 font-mono text-xs uppercase tracking-[0.24em] transition",
+                    viewMode === "spymaster" ? "bg-ink text-white" : "text-black/65"
+                  )}
+                >
+                  Spymaster
+                </button>
+              </div>
+            </div>
+
+            {mobileMenuOpen ? (
+              <div className="grid gap-2 rounded-[20px] border border-black/10 bg-white/45 p-3">
+                <div className="flex items-center gap-2 rounded-[16px] border border-black/10 bg-white/70 px-3 py-2">
+                  <span className="min-w-0 flex-1 truncate font-mono text-[11px] tracking-[0.06em] text-black/65">
+                    {roomUrl}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={copyRoomLink}
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-black/10 bg-white/90 text-black/60 transition hover:bg-white hover:text-black"
+                    aria-label="Copy room link"
+                  >
+                    <CopyIcon />
+                  </button>
+                </div>
+                <Link
+                  href="/"
+                  className="rounded-full border border-black/10 bg-white/70 px-4 py-2 text-center font-mono text-xs uppercase tracking-[0.24em] text-black/65 transition hover:bg-white"
+                >
+                  Home
+                </Link>
+              </div>
+            ) : null}
+          </div>
+        </section>
+
+        {feedback ? (
+          <div className="rounded-[18px] border border-red-900/10 bg-red-100/70 px-4 py-3 text-sm text-red-950">
+            {feedback}
+          </div>
+        ) : null}
+
+        <section className="paper-panel relative px-3 py-3 md:px-4 md:py-4">
+          <div className="mb-3 flex flex-col gap-3 px-1 md:flex-row md:items-center md:justify-between">
+            <div className="flex items-center justify-between gap-3">
+              <div className="font-mono text-[11px] uppercase tracking-[0.28em] text-black/45">
+                Board
+              </div>
+              {readOnly ? (
+                <span className="rounded-full bg-black/5 px-3 py-1 font-mono text-[11px] uppercase tracking-[0.24em] text-black/60">
+                  Read only
+                </span>
+              ) : null}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={pendingAction !== null}
+                onClick={createNewGame}
+                className="rounded-full bg-ink px-4 py-2.5 font-mono text-xs uppercase tracking-[0.24em] text-white transition hover:-translate-y-0.5 hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {pendingAction === "new-game" ? "Shuffling..." : "New Game"}
               </button>
 
               <button
                 type="button"
                 disabled={controlsDisabled || readOnly}
-                onClick={() => void sendAction(`/api/rooms/${room.slug}/end-turn`)}
-                className="rounded-[18px] border border-black/10 bg-white/65 px-4 py-3 font-mono text-sm uppercase tracking-[0.24em] text-black/75 transition hover:border-black/20 hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={endTurnOptimistically}
+                className="rounded-full border border-black/10 bg-white/65 px-4 py-2.5 font-mono text-xs uppercase tracking-[0.24em] text-black/75 transition hover:border-black/20 hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
               >
-                End Turn
-              </button>
-
-              <button
-                type="button"
-                disabled={controlsDisabled || readOnly || game.revealedAll}
-                onClick={() => void sendAction(`/api/rooms/${room.slug}/reveal-all`)}
-                className="rounded-[18px] border border-black/10 bg-white/65 px-4 py-3 font-mono text-sm uppercase tracking-[0.24em] text-black/75 transition hover:border-black/20 hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {game.revealedAll ? "Board Revealed" : "Reveal Board"}
+                {pendingAction === "end-turn" ? "Ending..." : "End Turn"}
               </button>
             </div>
+          </div>
 
-            <div className="mt-5 grid gap-3">
-              <TeamPanel team="red" remaining={game.remaining.red} active={game.currentTurn === "red"} />
-              <TeamPanel team="blue" remaining={game.remaining.blue} active={game.currentTurn === "blue"} />
-            </div>
+          <div
+            className={clsx(
+              "grid grid-cols-5 gap-1.5 transition-opacity md:h-[calc(100dvh-13rem)] md:grid-rows-5 md:gap-3 lg:h-[calc(100dvh-12rem)]",
+              pendingAction === "new-game" && "opacity-45"
+            )}
+            data-board-grid
+          >
+            {game.cards.map((card) => (
+              <CardButton
+                key={card.id}
+                card={card}
+                game={game}
+                viewMode={viewMode}
+                disabled={controlsDisabled || readOnly}
+                onReveal={revealCardOptimistically}
+              />
+            ))}
+          </div>
 
-            <div className="mt-5 rounded-[20px] border border-black/10 bg-[#f2e5c9] px-4 py-4 text-sm leading-6 text-black/70">
-              {readOnly ? (
-                <p>Spymaster mode is read-only here to keep side-computer viewing safe.</p>
-              ) : (
-                <p>
-                  Click unrevealed cards on the board. Correct team cards keep the turn. Wrong,
-                  neutral, and assassin reveals resolve automatically.
-                </p>
-              )}
-            </div>
-
-            {feedback ? (
-              <div className="mt-4 rounded-[18px] border border-red-900/10 bg-red-100/70 px-4 py-3 text-sm text-red-950">
-                {feedback}
+          {pendingAction === "new-game" ? (
+            <div className="pointer-events-none absolute inset-x-6 top-24 flex justify-center md:top-28">
+              <div className="rounded-full border border-black/10 bg-white/90 px-4 py-2 font-mono text-xs uppercase tracking-[0.24em] text-black/65 shadow-card">
+                Shuffling new board
               </div>
-            ) : null}
-          </aside>
-
-          <section className="paper-panel px-3 py-3 md:px-4 md:py-4">
-            <div className="grid grid-cols-5 gap-2 md:gap-3">
-              {game.cards.map((card) => (
-                <CardButton
-                  key={card.id}
-                  card={card}
-                  game={game}
-                  viewMode={viewMode}
-                  disabled={controlsDisabled || readOnly}
-                  onReveal={(cardId) => void sendAction(`/api/rooms/${room.slug}/reveal`, { cardId })}
-                />
-              ))}
             </div>
-          </section>
+          ) : null}
         </section>
       </div>
     </main>
   );
 }
 
-function TeamPanel({
+function CopyIcon() {
+  return (
+    <svg viewBox="0 0 20 20" className="h-4 w-4" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.7">
+      <rect x="7" y="3" width="9" height="11" rx="2" />
+      <path d="M5 7H4a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h7a2 2 0 0 0 2-2v-1" />
+    </svg>
+  );
+}
+
+function HeaderTeamBadge({
   team,
   remaining,
-  active
+  active,
+  mobile = false
 }: {
   team: "red" | "blue";
   remaining: number;
   active: boolean;
+  mobile?: boolean;
 }) {
   return (
-    <div
+    <span
       className={clsx(
-        "rounded-[22px] border px-4 py-4 shadow-card transition",
-        team === "red" ? "border-red-900/10 bg-red-100/80 text-red-950" : "border-blue-900/10 bg-blue-100/80 text-blue-950"
+        "inline-flex items-center gap-2 rounded-full border font-mono uppercase transition",
+        mobile ? "px-2.5 py-1.5 text-[10px] tracking-[0.18em]" : "px-3 py-1.5 text-xs tracking-[0.24em]",
+        team === "red"
+          ? active
+            ? "border-red-900/10 bg-redTeam text-white"
+            : "border-red-900/10 bg-red-100/80 text-red-950"
+          : active
+            ? "border-blue-950/10 bg-blueTeam text-white"
+            : "border-blue-900/10 bg-blue-100/80 text-blue-950"
       )}
     >
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <div className="font-mono text-[11px] uppercase tracking-[0.28em] opacity-65">Team</div>
-          <div className="mt-1 font-display text-2xl uppercase tracking-[0.06em]">{team}</div>
-        </div>
-        <div className="text-right">
-          <div className="font-mono text-[11px] uppercase tracking-[0.28em] opacity-65">Remaining</div>
-          <div className="mt-1 font-display text-3xl leading-none">{remaining}</div>
-        </div>
-      </div>
-      <div className="mt-4">
+      <span>{team}</span>
+      <span className={clsx("font-display leading-none", mobile ? "text-lg" : "text-xl")}>{remaining}</span>
+      {active ? (
         <span
           className={clsx(
-            "rounded-full px-3 py-1 font-mono text-[11px] uppercase tracking-[0.24em]",
-            active ? "bg-black text-white" : "bg-black/10 text-black/60"
+            "rounded-full font-mono uppercase",
+            mobile ? "bg-white/20 px-1.5 py-0.5 text-[9px] tracking-[0.16em]" : "bg-white/20 px-2 py-0.5 text-[10px] tracking-[0.18em]"
           )}
         >
-          {active ? "Active turn" : "Waiting"}
+          Active
         </span>
-      </div>
-    </div>
+      ) : null}
+    </span>
   );
 }
 
@@ -373,24 +595,53 @@ function CardButton({
   disabled: boolean;
   onReveal: (cardId: string) => void;
 }) {
-  const isInteractive = !disabled && !card.revealed && !game.revealedAll && game.status === "active";
-  const styles = getCardStyles(card, viewMode, game.revealedAll);
+  const revealAll = game.revealedAll || game.status === "finished";
+  const isInteractive = !disabled && !card.revealed && !revealAll && game.status === "active";
+  const styles = getCardStyles(card, viewMode, revealAll);
 
   return (
     <button
       type="button"
       disabled={!isInteractive}
       onClick={() => onReveal(card.id)}
+      data-card-button
       className={clsx(
-        "group flex aspect-[1.02/1] min-h-[86px] items-center justify-center rounded-[18px] border px-2 py-2 text-center shadow-card transition md:min-h-[112px] md:px-3",
+        "group flex h-[58px] min-h-[58px] w-full min-w-0 items-center justify-center overflow-hidden rounded-[12px] border px-1 py-1 text-center shadow-[0_2px_5px_rgba(74,50,25,0.08)] transition md:h-full md:min-h-0 md:w-full md:rounded-[18px] md:px-3 md:py-2 md:shadow-card",
         styles,
         isInteractive && "hover:-translate-y-0.5 hover:shadow-xl",
         !isInteractive && "cursor-default"
       )}
     >
-      <span className="font-display text-lg uppercase leading-tight tracking-[0.06em] md:text-[1.45rem]">
+      <span
+        className={clsx(
+          "block min-w-0 max-w-full overflow-hidden font-display uppercase",
+          getWordClass(card.word)
+        )}
+      >
         {card.word}
       </span>
     </button>
   );
+}
+
+function getWordClass(word: string) {
+  const length = word.replace(/\s+/g, "").length;
+
+  if (length > 13) {
+    return "break-all text-[0.5rem] leading-[1.02] tracking-normal md:text-[0.9rem]";
+  }
+
+  if (length > 10) {
+    return "break-all text-[0.56rem] leading-[1.03] tracking-normal md:text-[1rem]";
+  }
+
+  if (length > 8) {
+    return "break-all text-[0.62rem] leading-[1.04] tracking-normal md:text-[1.08rem] md:tracking-[0.03em]";
+  }
+
+  if (length > 6) {
+    return "text-[0.68rem] leading-[1.04] tracking-normal md:text-[1.14rem] md:tracking-[0.03em]";
+  }
+
+  return "text-[0.78rem] leading-[1.06] tracking-[0.01em] md:text-[1.3rem] md:tracking-[0.04em]";
 }
