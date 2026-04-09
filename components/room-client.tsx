@@ -2,6 +2,7 @@
 
 import clsx from "clsx";
 import Link from "next/link";
+import QRCode from "qrcode";
 import { useEffect, useRef, useState } from "react";
 
 import type { BrowserSupabaseConfig } from "@/lib/env";
@@ -38,7 +39,9 @@ function getCardStyles(card: BoardCard, viewMode: ViewMode, revealAll: boolean) 
   }
 
   if (card.role === "assassin") {
-    return "border-black/20 bg-assassin text-white";
+    return card.revealed || revealAll
+      ? "border-black/20 bg-assassin text-white"
+      : "border-black/20 bg-[#c7baaa] text-[#18130f]";
   }
 
   return card.revealed || revealAll
@@ -61,11 +64,25 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
   const [feedback, setFeedback] = useState<string | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [roomUrl, setRoomUrl] = useState(`/r/${initialRoom.slug}`);
+  const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string | null>(null);
+  const [largeQrOpen, setLargeQrOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
+  const [spymasterConfirmCardId, setSpymasterConfirmCardId] = useState<string | null>(null);
+  const [winnerFlashLabel, setWinnerFlashLabel] = useState<string | null>(null);
+  const [isCoarsePointer, setIsCoarsePointer] = useState(false);
   const roomRef = useRef(room);
   const refreshTimeoutRef = useRef<number | null>(null);
   const refreshInFlightRef = useRef(false);
   const refreshQueuedRef = useRef(false);
+  const spymasterConfirmTimeoutRef = useRef<number | null>(null);
+  const winnerFlashTimeoutRef = useRef<number | null>(null);
+  const previousGameSnapshotRef = useRef<{
+    id: string | null;
+    status: GameState["status"] | null;
+  }>({
+    id: initialRoom.currentGame?.id ?? null,
+    status: initialRoom.currentGame?.status ?? null
+  });
 
   useEffect(() => {
     setViewMode(readSavedView(initialRoom.slug));
@@ -80,6 +97,37 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
   }, [room.slug]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    if (!roomUrl.startsWith("http")) {
+      setQrCodeDataUrl(null);
+      return;
+    }
+
+    void QRCode.toDataURL(roomUrl, {
+      errorCorrectionLevel: "M",
+      margin: 1,
+      width: 256,
+      color: {
+        dark: "#2b2924",
+        light: "#0000"
+      }
+    }).then((dataUrl) => {
+      if (!cancelled) {
+        setQrCodeDataUrl(dataUrl);
+      }
+    }).catch(() => {
+      if (!cancelled) {
+        setQrCodeDataUrl(null);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [roomUrl]);
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
@@ -92,12 +140,86 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
   }, [room]);
 
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const mediaQuery = window.matchMedia("(pointer: coarse)");
+    const updatePointerMode = () => setIsCoarsePointer(mediaQuery.matches);
+    updatePointerMode();
+
+    mediaQuery.addEventListener?.("change", updatePointerMode);
+    return () => {
+      mediaQuery.removeEventListener?.("change", updatePointerMode);
+    };
+  }, []);
+
+  useEffect(() => {
     return () => {
       if (refreshTimeoutRef.current !== null) {
         window.clearTimeout(refreshTimeoutRef.current);
       }
+
+      if (spymasterConfirmTimeoutRef.current !== null) {
+        window.clearTimeout(spymasterConfirmTimeoutRef.current);
+      }
+
+      if (winnerFlashTimeoutRef.current !== null) {
+        window.clearTimeout(winnerFlashTimeoutRef.current);
+      }
     };
   }, []);
+
+  useEffect(() => {
+    clearSpymasterConfirm();
+  }, [viewMode, room.currentGame?.id, room.currentGame?.updatedAt]);
+
+  useEffect(() => {
+    const currentGame = room.currentGame;
+    const previous = previousGameSnapshotRef.current;
+
+    if (!currentGame) {
+      previousGameSnapshotRef.current = { id: null, status: null };
+      setWinnerFlashLabel(null);
+      return;
+    }
+
+    const wonThisRound =
+      currentGame.status === "finished" &&
+      currentGame.winner &&
+      currentGame.id === previous.id &&
+      previous.status === "active";
+
+    previousGameSnapshotRef.current = {
+      id: currentGame.id,
+      status: currentGame.status
+    };
+
+    if (!wonThisRound) {
+      if (currentGame.status === "active") {
+        setWinnerFlashLabel(null);
+      }
+      return;
+    }
+
+    const winningTeam = currentGame.winner;
+
+    if (!winningTeam) {
+      return;
+    }
+
+    const label = `${winningTeam.toUpperCase()} TEAM WINS`;
+    setWinnerFlashLabel(label);
+
+    if (winnerFlashTimeoutRef.current !== null) {
+      window.clearTimeout(winnerFlashTimeoutRef.current);
+    }
+
+    winnerFlashTimeoutRef.current = window.setTimeout(() => {
+      setWinnerFlashLabel(null);
+      winnerFlashTimeoutRef.current = null;
+    }, 3600);
+  }, [room.currentGame]);
 
   useEffect(() => {
     const supabase = getBrowserSupabaseClient(browserSupabaseConfig);
@@ -235,11 +357,38 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
     }
   }
 
+  function clearSpymasterConfirm() {
+    if (spymasterConfirmTimeoutRef.current !== null) {
+      window.clearTimeout(spymasterConfirmTimeoutRef.current);
+      spymasterConfirmTimeoutRef.current = null;
+    }
+
+    setSpymasterConfirmCardId(null);
+  }
+
+  function armSpymasterConfirm(cardId: string) {
+    clearSpymasterConfirm();
+    setSpymasterConfirmCardId(cardId);
+    spymasterConfirmTimeoutRef.current = window.setTimeout(() => {
+      setSpymasterConfirmCardId((current) => (current === cardId ? null : current));
+      spymasterConfirmTimeoutRef.current = null;
+    }, isCoarsePointer ? 1400 : 2200);
+  }
+
   function revealCardOptimistically(cardId: string) {
     const currentGame = room.currentGame;
 
     if (!currentGame) {
       return;
+    }
+
+    if (viewMode === "spymaster") {
+      if (spymasterConfirmCardId !== cardId) {
+        armSpymasterConfirm(cardId);
+        return;
+      }
+
+      clearSpymasterConfirm();
     }
 
     const outcome = applyRevealCard(currentGame, cardId);
@@ -262,6 +411,7 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
       return;
     }
 
+    clearSpymasterConfirm();
     void sendAction(`/api/rooms/${room.slug}/end-turn`, {
       optimisticRoom: { ...room, currentGame: applyEndTurn(currentGame) },
       pendingAction: "end-turn"
@@ -269,6 +419,7 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
   }
 
   function createNewGame() {
+    clearSpymasterConfirm();
     void sendAction(`/api/rooms/${room.slug}/new-game`, {
       pendingAction: "new-game"
     });
@@ -305,8 +456,8 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
   }
 
   const controlsDisabled = pendingAction !== null || game.status !== "active";
-  const readOnly = viewMode === "spymaster";
-  const winnerLabel = game.status === "finished" && game.winner ? `${game.winner.toUpperCase()} TEAM WINS` : null;
+  const boardFinished = game.status === "finished";
+  const winnerTagLabel = game.winner ? `${game.winner.toUpperCase()} TEAM WINS` : null;
 
   return (
     <main className="grain min-h-screen px-4 py-4 md:px-6 md:py-5">
@@ -324,9 +475,9 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
                 <span className="rounded-full border border-black/10 bg-white/45 px-3 py-1.5 font-mono text-xs uppercase tracking-[0.24em] text-black/65">
                   Room {room.slug}
                 </span>
-                {winnerLabel ? (
+                {winnerTagLabel ? (
                   <span className="rounded-full bg-[#ded2b7] px-3 py-1.5 font-mono text-xs uppercase tracking-[0.24em] text-black/75">
-                    {winnerLabel}
+                    {winnerTagLabel}
                   </span>
                 ) : null}
                 <HeaderTeamBadge team="red" remaining={game.remaining.red} active={game.currentTurn === "red"} />
@@ -358,7 +509,25 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
                 </button>
               </div>
               <div className="flex items-center gap-2 rounded-full border border-black/10 bg-white/55 px-3 py-1.5">
-                <span className="max-w-[320px] truncate font-mono text-[11px] tracking-[0.08em] text-black/60 xl:max-w-[420px]">
+                {qrCodeDataUrl ? (
+                  <button
+                    type="button"
+                    onClick={() => setLargeQrOpen((value) => !value)}
+                    className={clsx(
+                      "shrink-0 rounded-[10px] border border-black/10 bg-white p-1 transition hover:border-black/20 hover:bg-white",
+                      largeQrOpen && "border-black/20 bg-white shadow-sm"
+                    )}
+                    aria-label="Toggle large QR code"
+                    aria-expanded={largeQrOpen}
+                  >
+                    <img
+                      src={qrCodeDataUrl}
+                      alt={`QR code for ${roomUrl}`}
+                      className="h-9 w-9"
+                    />
+                  </button>
+                ) : null}
+                <span className="max-w-[260px] truncate font-mono text-[11px] tracking-[0.08em] text-black/60 lg:max-w-[320px] xl:max-w-[420px]">
                   {roomUrl}
                 </span>
                 <button
@@ -400,9 +569,9 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
             </div>
 
             <div className="flex flex-wrap items-center gap-2.5">
-              {winnerLabel ? (
+              {winnerTagLabel ? (
                 <span className="rounded-full bg-[#ded2b7] px-3 py-1.5 font-mono text-xs uppercase tracking-[0.24em] text-black/75">
-                  {winnerLabel}
+                  {winnerTagLabel}
                 </span>
               ) : null}
               <HeaderTeamBadge team="red" remaining={game.remaining.red} active={game.currentTurn === "red"} mobile />
@@ -449,6 +618,22 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
                     <CopyIcon />
                   </button>
                 </div>
+                {qrCodeDataUrl ? (
+                  <div className="flex flex-col items-center gap-3 rounded-[18px] border border-black/10 bg-white/80 p-4">
+                    <img
+                      src={qrCodeDataUrl}
+                      alt={`QR code for ${roomUrl}`}
+                      className="h-36 w-36 rounded-[14px] bg-white p-2"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setLargeQrOpen((value) => !value)}
+                      className="rounded-full border border-black/10 bg-white px-4 py-2 font-mono text-xs uppercase tracking-[0.24em] text-black/65 transition hover:bg-[#fffdf6]"
+                    >
+                      {largeQrOpen ? "Hide Large QR" : "Show Large QR"}
+                    </button>
+                  </div>
+                ) : null}
                 <Link
                   href="/"
                   className="rounded-full border border-black/10 bg-white/70 px-4 py-2 text-center font-mono text-xs uppercase tracking-[0.24em] text-black/65 transition hover:bg-white"
@@ -458,6 +643,18 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
               </div>
             ) : null}
           </div>
+
+          {largeQrOpen && qrCodeDataUrl ? (
+            <div className="mt-3 hidden justify-end md:flex">
+              <div className="rounded-[24px] border border-black/10 bg-white/85 p-5 shadow-card">
+                <img
+                  src={qrCodeDataUrl}
+                  alt={`Large QR code for ${roomUrl}`}
+                  className="h-64 w-64 rounded-[18px] bg-white p-3"
+                />
+              </div>
+            </div>
+          ) : null}
         </section>
 
         {feedback ? (
@@ -468,15 +665,10 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
 
         <section className="paper-panel relative px-3 py-3 md:px-4 md:py-4">
           <div className="mb-3 flex flex-col gap-3 px-1 md:flex-row md:items-center md:justify-between">
-            <div className="flex items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2.5">
               <div className="font-mono text-[11px] uppercase tracking-[0.28em] text-black/45">
                 Board
               </div>
-              {readOnly ? (
-                <span className="rounded-full bg-black/5 px-3 py-1 font-mono text-[11px] uppercase tracking-[0.24em] text-black/60">
-                  Read only
-                </span>
-              ) : null}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -491,7 +683,7 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
 
               <button
                 type="button"
-                disabled={controlsDisabled || readOnly}
+                disabled={controlsDisabled}
                 onClick={endTurnOptimistically}
                 className="rounded-full border border-black/10 bg-white/65 px-4 py-2.5 font-mono text-xs uppercase tracking-[0.24em] text-black/75 transition hover:border-black/20 hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"
               >
@@ -500,29 +692,56 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
             </div>
           </div>
 
-          <div
-            className={clsx(
-              "grid grid-cols-5 gap-1.5 transition-opacity md:h-[calc(100dvh-13rem)] md:grid-rows-5 md:gap-3 lg:h-[calc(100dvh-12rem)]",
-              pendingAction === "new-game" && "opacity-45"
-            )}
-            data-board-grid
-          >
-            {game.cards.map((card) => (
-              <CardButton
-                key={card.id}
-                card={card}
-                game={game}
-                viewMode={viewMode}
-                disabled={controlsDisabled || readOnly}
-                onReveal={revealCardOptimistically}
-              />
-            ))}
+          <div className="relative">
+            <div
+              className={clsx(
+                "grid grid-cols-5 gap-1.5 transition-opacity md:h-[calc(100dvh-13rem)] md:grid-rows-5 md:gap-3 lg:h-[calc(100dvh-12rem)]",
+                pendingAction === "new-game" && "opacity-45",
+                boardFinished && "opacity-95 saturate-[0.9] grayscale-[0.12]"
+              )}
+              data-board-grid
+            >
+              {game.cards.map((card) => (
+                <CardButton
+                  key={card.id}
+                  card={card}
+                  game={game}
+                  viewMode={viewMode}
+                  disabled={controlsDisabled}
+                  armed={viewMode === "spymaster" && spymasterConfirmCardId === card.id}
+                  showDesktopCheck={viewMode === "spymaster" && !isCoarsePointer && spymasterConfirmCardId === card.id}
+                  onReveal={revealCardOptimistically}
+                />
+              ))}
+            </div>
+
+            {winnerFlashLabel ? (
+              <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center">
+                <div className="winner-flash rounded-[22px] border border-black/10 bg-white/82 px-5 py-4 text-center shadow-card backdrop-blur-[2px]">
+                  <span className="font-display text-2xl uppercase tracking-[0.08em] text-ink md:text-4xl">
+                    {winnerFlashLabel}
+                  </span>
+                </div>
+              </div>
+            ) : null}
           </div>
 
           {pendingAction === "new-game" ? (
             <div className="pointer-events-none absolute inset-x-6 top-24 flex justify-center md:top-28">
               <div className="rounded-full border border-black/10 bg-white/90 px-4 py-2 font-mono text-xs uppercase tracking-[0.24em] text-black/65 shadow-card">
                 Shuffling new board
+              </div>
+            </div>
+          ) : null}
+
+          {largeQrOpen && qrCodeDataUrl ? (
+            <div className="mt-4 flex justify-center md:hidden">
+              <div className="rounded-[24px] border border-black/10 bg-white/90 p-4 shadow-card">
+                <img
+                  src={qrCodeDataUrl}
+                  alt={`Large QR code for ${roomUrl}`}
+                  className="h-56 w-56 rounded-[18px] bg-white p-3"
+                />
               </div>
             </div>
           ) : null}
@@ -587,17 +806,39 @@ function CardButton({
   game,
   viewMode,
   disabled,
+  armed,
+  showDesktopCheck,
   onReveal
 }: {
   card: BoardCard;
   game: GameState;
   viewMode: ViewMode;
   disabled: boolean;
+  armed: boolean;
+  showDesktopCheck: boolean;
   onReveal: (cardId: string) => void;
 }) {
   const revealAll = game.revealedAll || game.status === "finished";
   const isInteractive = !disabled && !card.revealed && !revealAll && game.status === "active";
   const styles = getCardStyles(card, viewMode, revealAll);
+  const [exploding, setExploding] = useState(false);
+  const previousRevealedRef = useRef(card.revealed);
+
+  useEffect(() => {
+    const wasRevealed = previousRevealedRef.current;
+    previousRevealedRef.current = card.revealed;
+
+    if (card.role !== "assassin" || wasRevealed || !card.revealed) {
+      return;
+    }
+
+    setExploding(true);
+    const timeoutId = window.setTimeout(() => setExploding(false), 850);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [card.revealed, card.role]);
 
   return (
     <button
@@ -606,15 +847,32 @@ function CardButton({
       onClick={() => onReveal(card.id)}
       data-card-button
       className={clsx(
-        "group flex h-[58px] min-h-[58px] w-full min-w-0 items-center justify-center overflow-hidden rounded-[12px] border px-1 py-1 text-center shadow-[0_2px_5px_rgba(74,50,25,0.08)] transition md:h-full md:min-h-0 md:w-full md:rounded-[18px] md:px-3 md:py-2 md:shadow-card",
+        "group relative flex h-[58px] min-h-[58px] w-full min-w-0 items-center justify-center overflow-hidden rounded-[12px] border px-1 py-1 text-center shadow-[0_2px_5px_rgba(74,50,25,0.08)] transition md:h-full md:min-h-0 md:w-full md:rounded-[18px] md:px-3 md:py-2 md:shadow-card",
         styles,
+        armed && "border-black/25 ring-2 ring-black/10",
         isInteractive && "hover:-translate-y-0.5 hover:shadow-xl",
         !isInteractive && "cursor-default"
       )}
     >
+      {showDesktopCheck ? (
+        <span className="pointer-events-none absolute right-1.5 top-1.5 z-[2] flex h-6 w-6 items-center justify-center rounded-full bg-ink text-[13px] text-white shadow-lg md:right-2 md:top-2">
+          ✓
+        </span>
+      ) : null}
+      {exploding ? (
+        <span className="pointer-events-none absolute inset-0 z-10">
+          <span className="assassin-ring" />
+          {[0, 60, 120, 180, 240, 300].map((angle) => (
+            <span key={angle} className="assassin-spark" style={{ transform: `rotate(${angle}deg)` }}>
+              <span className="assassin-spark-dot" />
+            </span>
+          ))}
+          <span className="assassin-burst">💥</span>
+        </span>
+      ) : null}
       <span
         className={clsx(
-          "block min-w-0 max-w-full overflow-hidden font-display uppercase",
+          "relative z-[1] block min-w-0 max-w-full overflow-hidden font-display uppercase",
           getWordClass(card.word)
         )}
       >
@@ -628,20 +886,20 @@ function getWordClass(word: string) {
   const length = word.replace(/\s+/g, "").length;
 
   if (length > 13) {
-    return "break-all text-[0.5rem] leading-[1.02] tracking-normal md:text-[0.9rem]";
+    return "break-all text-[0.5rem] leading-[1.02] tracking-normal md:text-[1.08rem] lg:text-[1.14rem]";
   }
 
   if (length > 10) {
-    return "break-all text-[0.56rem] leading-[1.03] tracking-normal md:text-[1rem]";
+    return "break-all text-[0.56rem] leading-[1.03] tracking-normal md:text-[1.18rem] lg:text-[1.26rem]";
   }
 
   if (length > 8) {
-    return "break-all text-[0.62rem] leading-[1.04] tracking-normal md:text-[1.08rem] md:tracking-[0.03em]";
+    return "break-all text-[0.62rem] leading-[1.04] tracking-normal md:text-[1.32rem] md:tracking-[0.03em] lg:text-[1.42rem]";
   }
 
   if (length > 6) {
-    return "text-[0.68rem] leading-[1.04] tracking-normal md:text-[1.14rem] md:tracking-[0.03em]";
+    return "text-[0.68rem] leading-[1.04] tracking-normal md:text-[1.46rem] md:tracking-[0.03em] lg:text-[1.58rem]";
   }
 
-  return "text-[0.78rem] leading-[1.06] tracking-[0.01em] md:text-[1.3rem] md:tracking-[0.04em]";
+  return "text-[0.78rem] leading-[1.06] tracking-[0.01em] md:text-[1.72rem] md:tracking-[0.04em] lg:text-[1.9rem]";
 }
