@@ -460,7 +460,7 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
   const winnerTagLabel = game.winner ? `${game.winner.toUpperCase()} TEAM WINS` : null;
 
   return (
-    <main className="grain min-h-screen px-4 py-4 md:px-6 md:py-5">
+    <main className="grain min-h-screen px-4 py-4 md:px-6 md:py-9">
       <div className="mx-auto flex max-w-[1500px] flex-col gap-4">
         <section className="paper-panel px-4 py-3 md:px-5">
           <div className="hidden items-center justify-between gap-4 md:flex">
@@ -695,7 +695,7 @@ export function RoomClient({ initialRoom, browserSupabaseConfig }: RoomClientPro
           <div className="relative">
             <div
               className={clsx(
-                "grid grid-cols-5 gap-1.5 transition-opacity md:h-[calc(100dvh-13rem)] md:grid-rows-5 md:gap-3 lg:h-[calc(100dvh-12rem)]",
+                "grid grid-cols-5 gap-1.5 transition-opacity md:h-[calc(100dvh-15rem)] md:grid-rows-5 md:gap-3 lg:h-[calc(100dvh-14rem)]",
                 pendingAction === "new-game" && "opacity-45",
                 boardFinished && "opacity-95 saturate-[0.9] grayscale-[0.12]"
               )}
