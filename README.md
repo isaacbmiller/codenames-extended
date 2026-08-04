@@ -35,6 +35,12 @@ A Horsepaste-inspired Codenames clone for Vercel with:
 3. Make sure the Supabase SQL schema has already been applied.
 4. Deploy.
 
+The `Supabase keep-alive` GitHub Actions workflow performs a minimal read from
+Supabase daily so a Free-plan project has regular activity. It requires the
+`SUPABASE_URL` and `SUPABASE_ANON_KEY` repository secrets. This is a best-effort
+inactivity safeguard; upgrading to Supabase Pro is the only way to guarantee that
+a project will not be paused for inactivity.
+
 ## Wordlist
 
 The bundled word pack is generated from curated online Codenames-style source lists and deduplicated locally. Source attribution is recorded in `data/word-sources.md`.
